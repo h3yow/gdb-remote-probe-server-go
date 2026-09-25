@@ -198,9 +198,13 @@ func startAccepting(t *testing.T, srv *Server) net.Listener {
 	return ln
 }
 
+func dialTCP(ln net.Listener) (net.Conn, error) {
+	return net.Dial("tcp", ln.Addr().String())
+}
+
 func dialPair(t *testing.T, srv *Server) (net.Conn, *client) {
 	ln := startAccepting(t, srv)
-	clConn, err := net.Dial("tcp", ln.Addr().String())
+	clConn, err := dialTCP(ln)
 	if err != nil {
 		t.Fatal(err)
 	}

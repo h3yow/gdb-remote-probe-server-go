@@ -277,12 +277,34 @@ func (f *Framer) SendPacket(ctx context.Context, body []byte) error {
 }
 
 // RecvPacket returns the next packet or interrupt frame.
+// RecvPacket returns the next packet or interrupt frame.
 func (f *Framer) RecvPacket(ctx context.Context) (Frame, error) {
+	return f.recv(ctx, nil)
+}
+
+// ErrIdleTimeout is returned when a receive waits longer than the
+// configured idle duration without an inbound frame.
+var ErrIdleTimeout = errors.New("idle session timeout")
+
+// RecvPacketIdle behaves like RecvPacket but bounds how long it waits for
+// the next frame. On timeout it returns ErrIdleTimeout without spawning or
+// leaking a goroutine: the wait is a single select in this call.
+func (f *Framer) RecvPacketIdle(ctx context.Context, idle time.Duration) (Frame, error) {
+	if idle <= 0 {
+		return f.recv(ctx, nil)
+	}
+	timer := f.cfg.Clock.NewTimer(idle)
+	return f.recv(ctx, timer.C())
+}
+
+func (f *Framer) recv(ctx context.Context, idle <-chan time.Time) (Frame, error) {
 	select {
 	case fr := <-f.frames:
 		return fr, nil
 	case err := <-f.readErr:
 		return Frame{}, err
+	case <-idle:
+		return Frame{}, ErrIdleTimeout
 	case <-ctx.Done():
 		return Frame{}, ctx.Err()
 	case <-f.closed:

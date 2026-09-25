@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -149,28 +150,14 @@ func (s *Server) serveSession(ctx context.Context, sess *session.Session, fr *pr
 	var lastPacket string
 	var lastReply []byte
 
-	var idle *time.Timer
-	var idleCh <-chan time.Time
-	if s.cfg.IdleTimeout > 0 {
-		idle = time.NewTimer(s.cfg.IdleTimeout)
-		defer idle.Stop()
-		idleCh = idle.C
-	}
-	resetIdle := func() {
-		if idle == nil {
-			return
-		}
-		if !idle.Stop() {
-			select {
-			case <-idle.C:
-			default:
-			}
-		}
-		idle.Reset(s.cfg.IdleTimeout)
-	}
+	// Idle timeout is applied per receive call; no long-lived timer state
+	// is needed, so a silent session converges deterministically.
+	idle := s.cfg.IdleTimeout
+	_ = time.Second
+	resetIdle := func() {}
 
 	for {
-		frame, err := recvWithIdle(ctx, fr, idleCh)
+		frame, err := recvWithIdle(ctx, fr, idle)
 		if err != nil {
 			s.cfg.Log.Printf("connection ended: %v session=%d state=%s",
 				err, sess.ID(), sess.Status())
@@ -231,7 +218,7 @@ func (s *Server) serveSession(ctx context.Context, sess *session.Session, fr *pr
 				continue
 			}
 			s.cfg.Log.Printf("target resumed session=%d state=running", sess.ID())
-			stopReply, err := s.runUntilStop(ctx, sess, fr, idleCh)
+			stopReply, err := s.runUntilStop(ctx, sess, fr, idle)
 			if err != nil {
 				return err
 			}
@@ -267,9 +254,9 @@ func (s *Server) serveSession(ctx context.Context, sess *session.Session, fr *pr
 // runUntilStop waits for the target to stop. The only accepted inbound
 // element is a raw 0x03 interrupt; packets are refused. Disconnects
 // deterministically detach the session and converge the target to stopped.
-func (s *Server) runUntilStop(ctx context.Context, sess *session.Session, fr *protocol.Framer, idleCh <-chan time.Time) ([]byte, error) {
+func (s *Server) runUntilStop(ctx context.Context, sess *session.Session, fr *protocol.Framer, idle time.Duration) ([]byte, error) {
 	for sess.Target().IsRunning() {
-		frame, err := recvWithIdle(ctx, fr, idleCh)
+		frame, err := recvWithIdle(ctx, fr, idle)
 		if err != nil {
 			s.cfg.Log.Printf("disconnect while running: %v session=%d -> converge detach",
 				err, sess.ID())
@@ -303,29 +290,16 @@ func (s *Server) cleanup(sess *session.Session) error {
 	return nil
 }
 
-// recvWithIdle returns the next frame or an idle-timeout error.
-func recvWithIdle(ctx context.Context, fr *protocol.Framer, idleCh <-chan time.Time) (protocol.Frame, error) {
-	if idleCh == nil {
-		return fr.RecvPacket(ctx)
-	}
-	type res struct {
-		fr  protocol.Frame
-		err error
-	}
-	ch := make(chan res, 1)
-	go func() {
-		f, err := fr.RecvPacket(ctx)
-		ch <- res{f, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.fr, r.err
-	case <-idleCh:
+// recvWithIdle returns the next frame or an idle-timeout error. The wait
+// happens in a single select inside the framer, so no goroutine is
+// spawned and cancellation cannot race frame delivery.
+func recvWithIdle(ctx context.Context, fr *protocol.Framer, idle time.Duration) (protocol.Frame, error) {
+	frame, err := fr.RecvPacketIdle(ctx, idle)
+	if errors.Is(err, protocol.ErrIdleTimeout) {
 		return protocol.Frame{}, &target.Error{Code: target.CodeTimeout, Op: "idle",
 			Detail: "idle session timeout"}
-	case <-ctx.Done():
-		return protocol.Frame{}, ctx.Err()
 	}
+	return frame, err
 }
 
 func hex2(c target.Code) string {
