@@ -80,7 +80,7 @@ func TestCorruptionErrorCodes(t *testing.T) {
 		{"truncated", func(b []byte) []byte { return b[:8] }, CodeImageTooShort},
 		{"bad magic", func(b []byte) []byte { b[0] = 'X'; return b }, CodeBadMagic},
 		{"bad version", func(b []byte) []byte { b[8] = 99; return b }, CodeUnsupportedVersion},
-		{"bad length", func(b []byte) []byte { b[12]++ ; return b }, CodeImageCorrupt},
+		{"bad length", func(b []byte) []byte { b[12]++; return b }, CodeImageCorrupt},
 		{"bad checksum", func(b []byte) []byte { b[len(b)-1] ^= 0xFF; return b }, CodeBadChecksum},
 	}
 	for _, tc := range cases {

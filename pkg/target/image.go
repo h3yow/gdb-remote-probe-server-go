@@ -162,9 +162,9 @@ func (img *Image) segmentFor(addr uint32) *Segment {
 }
 
 const (
-	imageMagic    = "RPROBE01"
-	imageVersion  = uint32(1)
-	imageHdrLen   = len(imageMagic) + 4 + 4 // magic + version + payload length
+	imageMagic   = "RPROBE01"
+	imageVersion = uint32(1)
+	imageHdrLen  = len(imageMagic) + 4 + 4 // magic + version + payload length
 )
 
 type wirePayload struct {
