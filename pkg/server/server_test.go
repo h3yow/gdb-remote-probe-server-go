@@ -380,8 +380,8 @@ func TestSecondSessionRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second conn read: %v", err)
 	}
-	if !bytes.Contains(buf[:n], []byte("E12")) {
-		t.Fatalf("second session want E12, got %q", buf[:n])
+	if !bytes.Contains(buf[:n], []byte("E11")) {
+		t.Fatalf("second session want E11, got %q", buf[:n])
 	}
 	if !strings.Contains(lg.String(), "session rejected") {
 		t.Fatal("rejection must be logged with reason")

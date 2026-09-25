@@ -126,7 +126,8 @@ func (s *Server) handleConn(ctx context.Context, conn io.ReadWriter) {
 	sess, err := s.mgr.Attach(ctx, s.cfg.TargetName)
 	if err != nil {
 		s.cfg.Log.Printf("session rejected: %v", err)
-		_, _ = conn.Write(protocol.EncodePacket([]byte("E12"))) // CodeSessionBusy
+		busy := []byte("E" + hex2(target.CodeSessionBusy))
+		_, _ = conn.Write(protocol.EncodePacket(busy))
 		if c, ok := conn.(io.Closer); ok {
 			_ = c.Close()
 		}
