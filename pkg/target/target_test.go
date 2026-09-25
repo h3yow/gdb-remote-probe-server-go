@@ -197,7 +197,22 @@ func TestResumeInterruptAndHits(t *testing.T) {
 	if r.Kind != StopBreakpoint || r.PC != 0x04 || r.Hits != 1 {
 		t.Fatalf("stop = %+v", r)
 	}
-	// continue again: step-over leaves the breakpoint, loop never returns to it
+	// Re-continuing from the breakpoint PC stops there again (hit count 2).
+	if err := tg.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	r = tg.WaitStopped()
+	if r.Kind != StopBreakpoint || r.PC != 0x04 || r.Hits != 2 {
+		t.Fatalf("re-continue = %+v, want breakpoint hits=2", r)
+	}
+	// A single step transparently leaves the breakpoint PC (no pre-check).
+	if _, err := tg.Step(); err != nil {
+		t.Fatalf("step off breakpoint: %v", err)
+	}
+	// Clearing the breakpoint lets the target run free into the loop.
+	if err := tg.ClearBreakpoint(0x04); err != nil {
+		t.Fatal(err)
+	}
 	if err := tg.Resume(); err != nil {
 		t.Fatal(err)
 	}

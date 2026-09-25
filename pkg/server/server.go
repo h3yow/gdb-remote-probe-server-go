@@ -200,26 +200,16 @@ func (s *Server) serveSession(ctx context.Context, sess *session.Session, fr *pr
 		s.cfg.Log.Printf("dispatch %q session=%d state=%s",
 			string(body), sess.ID(), sess.Status())
 
-		// Idempotent replay: an immediately retransmitted packet gets the
-		// cached reply instead of executing twice. State-changing commands
-		// are idempotent at the target layer (breakpoint set/clear,
-		// register/memory writes are absolute); resume packets are never
-		// cached because they are asynchronous.
+		// Idempotent replay: an immediately retransmitted synchronous
+		// packet (same as the last fully-answered command) gets the cached
+		// reply instead of executing twice. Target mutations are absolute
+		// and therefore safe to replay. The asynchronous resume ('c') is
+		// never replayed because its reply is a state transition that must
+		// occur afresh; the target handles breakpoint hits idempotently.
 		if string(body) == lastPacket && string(body) != "c" {
 			s.cfg.Log.Printf("replay cached reply %q for duplicate %q session=%d",
 				lastReply, string(body), sess.ID())
 			if err := fr.SendPacket(ctx, lastReply); err != nil {
-				return s.cleanup(sess)
-			}
-			continue
-		}
-
-		// Commands while a resume is in flight are a conflict. The resume
-		// loop owns the target until a stop, so reject deterministically.
-		if sess.Target().IsRunning() {
-			s.cfg.Log.Printf("reject packet %q session=%d reason=target-running",
-				string(body), sess.ID())
-			if err := fr.SendPacket(ctx, []byte("E0f")); err != nil { // CodeTargetRunning
 				return s.cleanup(sess)
 			}
 			continue
@@ -234,7 +224,10 @@ func (s *Server) serveSession(ctx context.Context, sess *session.Session, fr *pr
 			d.ClearResumePending()
 			if err := sess.Target().Resume(); err != nil {
 				s.cfg.Log.Printf("resume rejected: %v session=%d", err, sess.ID())
-				_ = fr.SendPacket(ctx, []byte("E"+hex2(target.CodeOf(err))))
+				errb := []byte("E" + hex2(target.CodeOf(err)))
+				_ = fr.SendPacket(ctx, errb)
+				lastPacket = string(body)
+				lastReply = append([]byte(nil), errb...)
 				continue
 			}
 			s.cfg.Log.Printf("target resumed session=%d state=running", sess.ID())
@@ -245,6 +238,8 @@ func (s *Server) serveSession(ctx context.Context, sess *session.Session, fr *pr
 			if err := fr.SendPacket(ctx, stopReply); err != nil {
 				return s.cleanup(sess)
 			}
+			lastPacket = string(body)
+			lastReply = append([]byte(nil), stopReply...)
 			continue
 		}
 

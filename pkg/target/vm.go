@@ -100,9 +100,6 @@ type Target struct {
 	regs [RegN]uint32
 
 	breakpoints map[uint32]*Breakpoint
-	// stepOver, when non-zero, makes the next Resume pre-check at this
-	// address transparent (one-shot, consumed on resume).
-	stepOver uint32
 
 	running bool
 	stop    StopReason
@@ -192,7 +189,6 @@ func (t *Target) hardReset() {
 	t.regs = [RegN]uint32{}
 	t.regs[RegPC] = t.image.Entry
 	t.breakpoints = make(map[uint32]*Breakpoint)
-	t.stepOver = 0
 	t.running = false
 	t.stop = StopReason{}
 	t.stopReq = make(chan struct{})
@@ -418,9 +414,6 @@ func (t *Target) ClearBreakpoint(addr uint32) error {
 		return newError(CodeTargetRunning, op, "cannot clear breakpoint while running")
 	}
 	delete(t.breakpoints, addr)
-	if t.stepOver == addr {
-		t.stepOver = 0
-	}
 	return nil
 }
 
@@ -446,6 +439,9 @@ func (t *Target) Step() (StopReason, error) {
 		return r, newError(CodeTargetHalted, "Step", "target is halted: "+r.Kind.String())
 	}
 	t.beginRunLocked()
+	// Step executes the instruction at the current PC without the resume
+	// pre-check, so stepping off a stopped breakpoint is transparent;
+	// landing on a breakpoint afterwards reports normally.
 	reason := t.execOneLocked()
 	t.finishRunLocked(reason)
 	t.mu.Unlock()
@@ -469,13 +465,12 @@ func (t *Target) Resume() error {
 		}
 		return newError(CodeTargetHalted, "Resume", "target is halted: "+r.Kind.String())
 	}
-	// Pre-check: a breakpoint under the current PC stops immediately,
-	// unless this is a one-shot step-over at the same address.
-	if t.stepOver == t.regs[RegPC] {
-		t.stepOver = 0
-	} else if bp, ok := t.breakpoints[t.regs[RegPC]]; ok {
+	// A breakpoint under the current PC stops a continue immediately.
+	// Re-continuing from a stopped breakpoint is the debugger's explicit
+	// choice: standard RSP requires it to stop again; to pass the site
+	// the debugger must single-step or clear the breakpoint first.
+	if bp, ok := t.breakpoints[t.regs[RegPC]]; ok {
 		bp.Hits++
-		t.stepOver = t.regs[RegPC] // next resume transparently leaves this PC
 		r := StopReason{Kind: StopBreakpoint, PC: t.regs[RegPC], Hits: bp.Hits}
 		t.stop = r
 		t.mu.Unlock()
@@ -708,7 +703,6 @@ func (t *Target) execOneLocked() StopReason {
 	np := t.regs[RegPC]
 	if bp, ok := t.breakpoints[np]; ok {
 		bp.Hits++
-		t.stepOver = np
 		return StopReason{Kind: StopBreakpoint, PC: np, Hits: bp.Hits}
 	}
 	return StopReason{}
