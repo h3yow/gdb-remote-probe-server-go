@@ -27,6 +27,7 @@ const (
 	ErrBPConflict       byte = 0x31
 	ErrNoBP             byte = 0x32
 	ErrBPBadAddr        byte = 0x33
+	ErrBPBadCond        byte = 0x34
 	ErrSymbol           byte = 0x40
 	ErrUnknownCmd       byte = 0xFF
 )
@@ -61,6 +62,8 @@ func mapTargetError(err error) byte {
 		return ErrNoBP
 	case errors.Is(err, target.ErrBPBadAddr):
 		return ErrBPBadAddr
+	case errors.Is(err, target.ErrBPBadCond):
+		return ErrBPBadCond
 	case errors.Is(err, image.ErrSymbolNotFound):
 		return ErrSymbol
 	default:
@@ -134,6 +137,16 @@ func (sess *Session) dispatch(req []byte) (string, bool) {
 		return "OK", true
 	case strings.HasPrefix(s, "qRcmd,"):
 		return sess.rcmd(s), false
+	case s == "qBPList":
+		return sess.bpList(), false
+	case strings.HasPrefix(s, "qBPEnable,"):
+		return sess.bpEnable(s[len("qBPEnable,"):], true), false
+	case strings.HasPrefix(s, "qBPDisable,"):
+		return sess.bpEnable(s[len("qBPDisable,"):], false), false
+	case strings.HasPrefix(s, "qBPBatch,"):
+		return sess.bpBatch(s[len("qBPBatch,"):]), false
+	case s == "qStopInfo":
+		return sess.stopInfo(), false
 	case strings.HasPrefix(s, "q") || strings.HasPrefix(s, "v"):
 		// Unsupported query: empty reply means "not supported".
 		return "", false
@@ -267,38 +280,185 @@ func (sess *Session) writeMemBinary(arg string, raw []byte) string {
 	return "OK"
 }
 
-// parseZArg splits "type,addr,kind".
-func parseZArg(s string) (uint32, error) {
-	parts := strings.SplitN(s, ",", 3)
+// parseZArg splits "type,addr,kind[;th=<hex>][;cond=<hex-text>]". The
+// optional suffixes attach a hit-count threshold and a condition expression
+// (hex-encoded source text) to a hardware breakpoint.
+func parseZArg(s string) (target.BreakpointSpec, error) {
+	var spec target.BreakpointSpec
+	main, opts, _ := strings.Cut(s, ";")
+	parts := strings.SplitN(main, ",", 3)
 	if len(parts) != 3 {
-		return 0, errors.New("bad breakpoint spec")
+		return spec, errors.New("bad breakpoint spec")
 	}
 	a, err := strconv.ParseUint(parts[1], 16, 32)
-	return uint32(a), err
+	if err != nil {
+		return spec, err
+	}
+	spec.Addr = uint32(a)
+	for _, opt := range strings.Split(opts, ";") {
+		if opt == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(opt, "=")
+		if !ok {
+			return spec, errors.New("bad breakpoint option")
+		}
+		switch k {
+		case "th":
+			th, err := strconv.ParseUint(v, 16, 64)
+			if err != nil {
+				return spec, err
+			}
+			spec.Threshold = th
+		case "cond":
+			raw, err := hex.DecodeString(v)
+			if err != nil {
+				return spec, err
+			}
+			spec.Condition = string(raw)
+		default:
+			return spec, errors.New("unknown breakpoint option")
+		}
+	}
+	return spec, nil
 }
 
 func (sess *Session) setBP(s string) string {
-	addr, err := parseZArg(s)
+	spec, err := parseZArg(s)
 	if err != nil {
 		return errorReply(ErrBPBadAddr)
 	}
-	if err := sess.target.SetBreakpoint(addr); err != nil {
+	if err := sess.target.SetBreakpointSpec(spec); err != nil {
 		return errorReply(mapTargetError(err))
 	}
-	sess.log.Printf("bp set %#x (slots=%d)", addr, len(sess.target.Breakpoints()))
+	sess.log.Printf("bp set %#x th=%d cond=%q (slots=%d)", spec.Addr,
+		effectiveThreshold(spec.Threshold), spec.Condition, len(sess.target.Breakpoints()))
 	return "OK"
 }
 
+// effectiveThreshold mirrors the target's 0-means-1 rule for log output.
+func effectiveThreshold(th uint64) uint64 {
+	if th == 0 {
+		return 1
+	}
+	return th
+}
+
 func (sess *Session) clearBP(s string) string {
-	addr, err := parseZArg(s)
+	spec, err := parseZArg(s)
 	if err != nil {
 		return errorReply(ErrBPBadAddr)
 	}
-	if err := sess.target.ClearBreakpoint(addr); err != nil {
+	if err := sess.target.ClearBreakpoint(spec.Addr); err != nil {
 		return errorReply(mapTargetError(err))
 	}
-	sess.log.Printf("bp clear %#x (slots=%d)", addr, len(sess.target.Breakpoints()))
+	sess.log.Printf("bp clear %#x (slots=%d)", spec.Addr, len(sess.target.Breakpoints()))
 	return "OK"
+}
+
+// bpList answers "qBPList" with one entry per breakpoint:
+// "<addr>,<enabled>,<hits>,<skips>,<threshold>,<condhex>" joined by ";",
+// or "none" when the table is empty. All numbers are hex except the
+// enabled flag (0/1).
+func (sess *Session) bpList() string {
+	bps := sess.target.Breakpoints()
+	if len(bps) == 0 {
+		return "none"
+	}
+	var sb strings.Builder
+	for i, b := range bps {
+		if i > 0 {
+			sb.WriteByte(';')
+		}
+		en := 0
+		if b.Enabled {
+			en = 1
+		}
+		fmt.Fprintf(&sb, "%x,%d,%x,%x,%x,%s", b.Addr, en, b.Hits, b.Skips,
+			effectiveThreshold(b.Threshold), hex.EncodeToString([]byte(b.Condition)))
+	}
+	return sb.String()
+}
+
+// bpEnable handles "qBPEnable,<addr>" / "qBPDisable,<addr>" (hex addr).
+func (sess *Session) bpEnable(arg string, enabled bool) string {
+	a, err := strconv.ParseUint(arg, 16, 32)
+	if err != nil {
+		return errorReply(ErrBPBadAddr)
+	}
+	if err := sess.target.EnableBreakpoint(uint32(a), enabled); err != nil {
+		return errorReply(mapTargetError(err))
+	}
+	sess.log.Printf("bp %#x enabled=%v", a, enabled)
+	return "OK"
+}
+
+// bpBatch handles "qBPBatch,<spec>;<spec>..." where each spec is
+// "<addrhex>:<thhex>:<condhex>" (condhex empty for none). The whole batch
+// is validated before commit: one bad item rejects everything and leaves
+// the breakpoint table untouched.
+func (sess *Session) bpBatch(arg string) string {
+	if arg == "" {
+		return errorReply(ErrBPBadAddr)
+	}
+	var specs []target.BreakpointSpec
+	for _, item := range strings.Split(arg, ";") {
+		parts := strings.SplitN(item, ":", 3)
+		if len(parts) != 3 {
+			return errorReply(ErrBPBadAddr)
+		}
+		a, err := strconv.ParseUint(parts[0], 16, 32)
+		if err != nil {
+			return errorReply(ErrBPBadAddr)
+		}
+		th, err := strconv.ParseUint(parts[1], 16, 64)
+		if err != nil {
+			return errorReply(ErrBPBadAddr)
+		}
+		var cond string
+		if parts[2] != "" {
+			raw, err := hex.DecodeString(parts[2])
+			if err != nil {
+				return errorReply(ErrBPBadAddr)
+			}
+			cond = string(raw)
+		}
+		specs = append(specs, target.BreakpointSpec{
+			Addr: uint32(a), Threshold: th, Condition: cond,
+		})
+	}
+	if err := sess.target.SetBreakpointsBatch(specs); err != nil {
+		code := mapTargetError(err)
+		sess.log.Printf("reject: bp batch of %d -> %s", len(specs), errorReply(code))
+		return errorReply(code)
+	}
+	sess.log.Printf("bp batch committed %d specs (slots=%d)", len(specs), len(sess.target.Breakpoints()))
+	return "OK"
+}
+
+// stopInfo answers "qStopInfo" with a detailed stop report:
+// "reason=<name>" plus, for breakpoint stops, the address and the
+// hit/skip counters of that breakpoint. Clients use this to tell a real
+// breakpoint stop apart from an external interrupt (pause) and to see how
+// many hits were skipped because the condition or threshold was not met.
+func (sess *Session) stopInfo() string {
+	info := sess.target.HaltInfo()
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "reason=%s", info.Reason)
+	switch info.Reason {
+	case target.ReasonBreakpoint:
+		fmt.Fprintf(&sb, ";addr=%x", info.BPAddr)
+		for _, b := range sess.target.Breakpoints() {
+			if b.Addr == info.BPAddr {
+				fmt.Fprintf(&sb, ";hits=%x;skips=%x", b.Hits, b.Skips)
+				break
+			}
+		}
+	case target.ReasonFault:
+		fmt.Fprintf(&sb, ";fault=%s", info.Fault)
+	}
+	fmt.Fprintf(&sb, ";pc=%x", info.PC)
+	return sb.String()
 }
 
 func (sess *Session) step() string {

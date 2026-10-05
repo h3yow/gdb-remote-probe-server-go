@@ -46,14 +46,20 @@ func (t *Target) stepLocked(overBreakpoint bool) HaltInfo {
 	pc := t.regs[RegPC]
 
 	// Dynamic (hardware) breakpoint at the instruction about to execute,
-	// unless the debugger explicitly asked to step over it.
+	// unless the debugger explicitly asked to step over it. Every reach
+	// counts as a hit; the target only stops when the condition holds and
+	// the cumulative hit count reached the threshold, otherwise the reach
+	// is recorded as a skip and execution continues uninterrupted.
 	if !overBreakpoint {
-		if hits, ok := t.breakpts[pc]; ok && t.bpEnabled[pc] {
-			t.breakpts[pc] = hits + 1
-			info := HaltInfo{Reason: ReasonBreakpoint, PC: pc, BPAddr: pc}
-			t.state = StateHalted
-			t.lastHalt = info
-			return info
+		if bp, ok := t.breakpts[pc]; ok && bp.enabled {
+			bp.hits++
+			if bp.cond.evalLocked(t) && bp.hits >= bp.threshold {
+				info := HaltInfo{Reason: ReasonBreakpoint, PC: pc, BPAddr: pc}
+				t.state = StateHalted
+				t.lastHalt = info
+				return info
+			}
+			bp.skips++
 		}
 	}
 
@@ -186,7 +192,10 @@ func (t *Target) Step() (HaltInfo, error) {
 		return HaltInfo{}, err
 	}
 	t.state = StateRunning
-	over := t.bpEnabled[t.regs[RegPC]]
+	over := false
+	if bp, ok := t.breakpts[t.regs[RegPC]]; ok {
+		over = bp.enabled
+	}
 	info := t.stepLocked(over)
 	if info.Reason == ReasonNone {
 		info = HaltInfo{Reason: ReasonStep, PC: t.regs[RegPC]}
@@ -250,7 +259,7 @@ func (t *Target) ContinueCtx(ctx context.Context) (HaltInfo, error) {
 	skipFirst := false
 	t.mu.Lock()
 	if t.lastHalt.Reason == ReasonBreakpoint {
-		if pc := t.regs[RegPC]; t.bpEnabled[pc] {
+		if bp, ok := t.breakpts[t.regs[RegPC]]; ok && bp.enabled {
 			skipFirst = true
 		}
 	}

@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"runtime"
 
 	"github.com/h3yow/gdb-remote-probe-server-go/pkg/protocol"
 	"github.com/h3yow/gdb-remote-probe-server-go/pkg/target"
@@ -24,7 +25,8 @@ type Session struct {
 }
 
 type runState struct {
-	done chan runResult
+	done     chan runResult
+	finished chan struct{} // closed when the run goroutine has returned
 }
 
 type runResult struct {
@@ -34,15 +36,26 @@ type runResult struct {
 
 // startRun launches an asynchronous Continue. The target itself executes
 // cooperatively without blocking I/O, so this is safe to drive from the
-// session loop.
+// session loop. It returns only once the target has actually entered the
+// running state (or the run already ended, e.g. an immediate trap): an
+// interrupt arriving before the transition would otherwise be lost.
 func (sess *Session) startRun() {
-	rs := &runState{done: make(chan runResult, 1)}
+	rs := &runState{done: make(chan runResult, 1), finished: make(chan struct{})}
 	sess.run = rs
 	sess.log.Printf("state -> running pc=%#x", sess.target.PC())
 	go func() {
 		info, err := sess.target.Continue()
 		rs.done <- runResult{info: info, err: err}
+		close(rs.finished)
 	}()
+	for sess.target.State() != target.StateRunning {
+		select {
+		case <-rs.finished:
+			return
+		default:
+		}
+		runtime.Gosched()
+	}
 }
 
 // finishRun drains the run completion and clears the running marker.

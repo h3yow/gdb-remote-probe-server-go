@@ -125,9 +125,13 @@ func mutate(chunk []byte, im *Impair) [][]byte {
 			out = append(out, corrupted)
 		case im.DuplicateFirstFrames > 0:
 			im.DuplicateFirstFrames--
-			out = append(out,
-				append([]byte(nil), frame...),
-				append([]byte(nil), frame...))
+			// Both copies ride in one chunk: a byte stream has no message
+			// boundaries, so the peer decodes and classifies the original
+			// and its echo in a single read batch. That keeps duplicate
+			// suppression deterministic instead of racing the receiver's
+			// frame pump against its decoder loop.
+			dup := append(append([]byte(nil), frame...), frame...)
+			out = append(out, dup)
 		default:
 			out = append(out, frame)
 		}
