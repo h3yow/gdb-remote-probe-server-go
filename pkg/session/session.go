@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 
 	"github.com/h3yow/gdb-remote-probe-server-go/pkg/protocol"
@@ -32,17 +33,21 @@ type runResult struct {
 	err  error
 }
 
-// startRun launches an asynchronous Continue. The target itself executes
-// cooperatively without blocking I/O, so this is safe to drive from the
-// session loop.
+// startRun launches an asynchronous Continue. It blocks until the target has
+// actually entered the running state, so a ctrl-c that arrives immediately
+// after the "running" log line always finds a live run handle to interrupt
+// (no startup race). The target executes cooperatively without blocking I/O,
+// so this is safe to drive from the session loop.
 func (sess *Session) startRun() {
 	rs := &runState{done: make(chan runResult, 1)}
 	sess.run = rs
-	sess.log.Printf("state -> running pc=%#x", sess.target.PC())
+	started := make(chan struct{})
 	go func() {
-		info, err := sess.target.Continue()
+		info, err := sess.target.ContinueStarted(context.Background(), started)
 		rs.done <- runResult{info: info, err: err}
 	}()
+	<-started
+	sess.log.Printf("state -> running pc=%#x", sess.target.PC())
 }
 
 // finishRun drains the run completion and clears the running marker.

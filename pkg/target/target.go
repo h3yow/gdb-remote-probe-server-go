@@ -68,7 +68,8 @@ type Reason uint8
 const (
 	ReasonNone       Reason = iota
 	ReasonPause             // interrupted by the debugger
-	ReasonBreakpoint        // BRK instruction or dynamic breakpoint
+	ReasonBreakpoint        // BRK instruction or plain dynamic breakpoint
+	ReasonBreakpointCond    // conditional/threshold breakpoint fired
 	ReasonStep              // single step completed
 	ReasonTerminated        // HALT executed
 	ReasonFault             // memory/decode fault
@@ -82,6 +83,8 @@ func (r Reason) String() string {
 		return "pause"
 	case ReasonBreakpoint:
 		return "breakpoint"
+	case ReasonBreakpointCond:
+		return "cond-breakpoint"
 	case ReasonStep:
 		return "step"
 	case ReasonTerminated:
@@ -143,16 +146,41 @@ const (
 
 // BreakpointInfo describes one installed breakpoint.
 type BreakpointInfo struct {
-	Addr    uint32
-	Enabled bool
-	Hits    uint64
+	Addr      uint32
+	Enabled   bool
+	Hits      uint64 // arrivals while enabled (stops + skips)
+	Stops     uint64 // arrivals that actually halted execution
+	Threshold uint64 // 0 = no threshold; otherwise stop only when Hits >= Threshold
+	Cond      string // condition source, "" = unconditional
+}
+
+// Skips returns how many enabled arrivals did not stop (condition false or
+// threshold not yet reached).
+func (b BreakpointInfo) Skips() uint64 { return b.Hits - b.Stops }
+
+// breakpoint is the internal slot record.
+type breakpoint struct {
+	enabled   bool
+	hits      uint64
+	stops     uint64
+	threshold uint64
+	cond      *Cond
+	condSrc   string
+}
+
+// BreakpointSpec is the atomic configure/set input for one breakpoint.
+type BreakpointSpec struct {
+	Addr      uint32
+	Cond      string // "" clears the condition
+	Threshold uint64 // 0 = no threshold
 }
 
 // HaltInfo is returned whenever execution stops.
 type HaltInfo struct {
 	Reason   Reason
 	PC       uint32
-	BPAddr   uint32 // valid when Reason == ReasonBreakpoint
+	BPAddr   uint32 // valid when Reason is ReasonBreakpoint/ReasonBreakpointCond
+	BPHits   uint64 // hit count of the breakpoint that stopped execution
 	Fault    FaultCode
 	FaultMsg string
 }
@@ -168,6 +196,7 @@ var (
 	ErrBPLimit         = errors.New("target: breakpoint slot limit reached")
 	ErrBPBadAddr       = errors.New("target: breakpoint address is not executable code")
 	ErrNoBreakpoint    = errors.New("target: no breakpoint at address")
+	ErrBPBadCond       = errors.New("target: invalid breakpoint condition")
 	ErrReadOnlyReg     = errors.New("target: register is read-only")
 	ErrOutOfRange      = errors.New("target: memory access out of range")
 	ErrBadPerm         = errors.New("target: permission denied")
@@ -185,8 +214,7 @@ type Target struct {
 	regs      [NumRegs]uint32
 	state     State
 	lastHalt  HaltInfo
-	breakpts  map[uint32]uint64 // addr -> hit count (presence == installed)
-	bpEnabled map[uint32]bool
+	breakpts  map[uint32]*breakpoint // addr -> slot (presence == installed)
 
 	// run is non-nil while a Continue loop owns the core.
 	run *runHandle
@@ -216,12 +244,11 @@ func New(im *image.Image) (*Target, error) {
 		return nil, err
 	}
 	t := &Target{
-		image:     im,
-		regions:   cloneRegions(im.Regions),
-		entry:     im.Entry,
-		breakpts:  make(map[uint32]uint64),
-		bpEnabled: make(map[uint32]bool),
-		budget:    1 << 20,
+		image:    im,
+		regions:  cloneRegions(im.Regions),
+		entry:    im.Entry,
+		breakpts: make(map[uint32]*breakpoint),
+		budget:   1 << 20,
 	}
 	t.regs[RegPC] = im.Entry
 	return t, nil
@@ -494,18 +521,56 @@ func (t *Target) Breakpoints() []BreakpointInfo {
 	}
 	out := make([]BreakpointInfo, 0, len(addrs))
 	for _, a := range addrs {
+		bp := t.breakpts[a]
 		out = append(out, BreakpointInfo{
-			Addr:    a,
-			Enabled: t.bpEnabled[a],
-			Hits:    t.breakpts[a],
+			Addr:      a,
+			Enabled:   bp.enabled,
+			Hits:      bp.hits,
+			Stops:     bp.stops,
+			Threshold: bp.threshold,
+			Cond:      bp.condSrc,
 		})
 	}
 	return out
 }
 
-// SetBreakpoint installs a hardware breakpoint. Idempotent: setting the same
-// address again succeeds and changes nothing (hit counts preserved). Distinct
-// errors cover alignment, non-code addresses and the slot limit.
+// validateSpecLocked checks one spec without mutating anything: address must
+// be aligned executable code and the condition must parse. It reports whether
+// the address is a new slot (for capacity accounting).
+func (t *Target) validateSpecLocked(spec BreakpointSpec) (cond *Cond, isNew bool, err error) {
+	_, exists := t.breakpts[spec.Addr]
+	if spec.Addr%4 != 0 {
+		return nil, false, fmt.Errorf("%w: %#x", ErrAlignment, spec.Addr)
+	}
+	if !exists && !t.isExecCodeLocked(spec.Addr) {
+		return nil, false, fmt.Errorf("%w: %#x is not executable code", ErrBPBadAddr, spec.Addr)
+	}
+	if spec.Cond != "" {
+		cond, err = ParseCond(spec.Cond)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	return cond, !exists, nil
+}
+
+// applySpecLocked commits an already-validated spec. Existing slots keep
+// their hit/stop counters; condition and threshold are replaced wholesale.
+func (t *Target) applySpecLocked(spec BreakpointSpec, cond *Cond) {
+	bp, ok := t.breakpts[spec.Addr]
+	if !ok {
+		bp = &breakpoint{enabled: true}
+		t.breakpts[spec.Addr] = bp
+	}
+	bp.cond = cond
+	bp.condSrc = spec.Cond
+	bp.threshold = spec.Threshold
+}
+
+// SetBreakpoint installs a plain hardware breakpoint. Idempotent: setting the
+// same address again succeeds and changes nothing (hit counts, condition and
+// threshold preserved). Distinct errors cover alignment, non-code addresses
+// and the slot limit.
 func (t *Target) SetBreakpoint(addr uint32) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -515,17 +580,107 @@ func (t *Target) SetBreakpoint(addr uint32) error {
 	if _, ok := t.breakpts[addr]; ok {
 		return nil // idempotent
 	}
-	if addr%4 != 0 {
-		return fmt.Errorf("%w: %#x", ErrAlignment, addr)
+	return t.applyBatchLocked([]BreakpointSpec{{Addr: addr}})
+}
+
+// SetBreakpointEx installs or reconfigures one breakpoint atomically: the
+// address is validated and the condition parsed before anything is committed,
+// so a rejected spec leaves the slot table untouched. Repeating the same spec
+// is a stable no-op result-wise.
+func (t *Target) SetBreakpointEx(spec BreakpointSpec) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.requireHaltedLocked(); err != nil {
+		return err
 	}
-	if !t.isExecCodeLocked(addr) {
-		return fmt.Errorf("%w: %#x is not executable code", ErrBPBadAddr, addr)
+	return t.applyBatchLocked([]BreakpointSpec{spec})
+}
+
+// ApplyBreakpoints installs/reconfigures a batch atomically: every spec is
+// validated (alignment, code address, condition syntax, slot capacity)
+// before the first one is applied; one invalid spec rejects the whole batch
+// and leaves the existing table untouched.
+func (t *Target) ApplyBreakpoints(specs []BreakpointSpec) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.requireHaltedLocked(); err != nil {
+		return err
 	}
-	if len(t.breakpts) >= MaxBreakpoints {
-		return fmt.Errorf("%w: %d slots, want %#x", ErrBPLimit, MaxBreakpoints, addr)
+	return t.applyBatchLocked(specs)
+}
+
+// applyBatchLocked validates all specs, then commits all. Caller holds t.mu.
+func (t *Target) applyBatchLocked(specs []BreakpointSpec) error {
+	type validated struct {
+		spec BreakpointSpec
+		cond *Cond
 	}
-	t.breakpts[addr] = 0
-	t.bpEnabled[addr] = true
+	seen := make(map[uint32]bool, len(specs))
+	newSlots := 0
+	vs := make([]validated, 0, len(specs))
+	for _, spec := range specs {
+		cond, isNew, err := t.validateSpecLocked(spec)
+		if err != nil {
+			return err
+		}
+		if isNew && !seen[spec.Addr] {
+			newSlots++
+		}
+		seen[spec.Addr] = true
+		vs = append(vs, validated{spec: spec, cond: cond})
+	}
+	if len(t.breakpts)+newSlots > MaxBreakpoints {
+		return fmt.Errorf("%w: %d slots, batch needs %d more",
+			ErrBPLimit, MaxBreakpoints, newSlots)
+	}
+	for _, v := range vs {
+		t.applySpecLocked(v.spec, v.cond)
+	}
+	return nil
+}
+
+// ConfigureBreakpoint atomically replaces the condition and threshold of an
+// existing breakpoint. The new condition is fully parsed before commit, so a
+// parse failure leaves the old condition/threshold in place (never a
+// half-updated slot). Hit and stop counters are preserved.
+func (t *Target) ConfigureBreakpoint(addr uint32, condSrc string, threshold uint64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.requireHaltedLocked(); err != nil {
+		return err
+	}
+	if _, ok := t.breakpts[addr]; !ok {
+		return fmt.Errorf("%w: %#x", ErrNoBreakpoint, addr)
+	}
+	var cond *Cond
+	if condSrc != "" {
+		c, err := ParseCond(condSrc)
+		if err != nil {
+			return err
+		}
+		cond = c
+	}
+	bp := t.breakpts[addr]
+	bp.cond = cond
+	bp.condSrc = condSrc
+	bp.threshold = threshold
+	return nil
+}
+
+// EnableBreakpoint flips the enabled flag of one slot atomically. Disabling
+// keeps the slot and its counters; a disabled breakpoint is never evaluated
+// and never counts hits.
+func (t *Target) EnableBreakpoint(addr uint32, enabled bool) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.requireHaltedLocked(); err != nil {
+		return err
+	}
+	bp, ok := t.breakpts[addr]
+	if !ok {
+		return fmt.Errorf("%w: %#x", ErrNoBreakpoint, addr)
+	}
+	bp.enabled = enabled
 	return nil
 }
 
@@ -542,7 +697,6 @@ func (t *Target) ClearBreakpoint(addr uint32) error {
 		return fmt.Errorf("%w: %#x", ErrNoBreakpoint, addr)
 	}
 	delete(t.breakpts, addr)
-	delete(t.bpEnabled, addr)
 	return nil
 }
 
@@ -557,8 +711,7 @@ func (t *Target) Reset() error {
 	t.regions = cloneRegions(t.image.Regions)
 	t.regs = [NumRegs]uint32{}
 	t.regs[RegPC] = t.entry
-	t.breakpts = make(map[uint32]uint64)
-	t.bpEnabled = make(map[uint32]bool)
+	t.breakpts = make(map[uint32]*breakpoint)
 	t.state = StateHalted
 	t.lastHalt = HaltInfo{}
 	t.run = nil

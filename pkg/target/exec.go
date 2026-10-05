@@ -28,6 +28,19 @@ func (t *Target) fetchLocked(pc uint32) (uint32, error) {
 	return word, nil
 }
 
+// qualifiesLocked reports whether a hit on this breakpoint should stop
+// execution: the cumulative hit count must have reached the threshold (if
+// any) and the condition (if any) must hold. Caller holds t.mu.
+func (bp *breakpoint) qualifiesLocked(t *Target) bool {
+	if bp.threshold > 0 && bp.hits < bp.threshold {
+		return false
+	}
+	if bp.cond != nil && !bp.cond.evalLocked(t) {
+		return false
+	}
+	return true
+}
+
 // decode fields of an instruction word.
 func decode(w uint32) (op, rd, rs uint8, imm uint16) {
 	return uint8(w >> 24), uint8(w>>20) & 0xF, uint8(w>>16) & 0xF, uint16(w)
@@ -48,12 +61,21 @@ func (t *Target) stepLocked(overBreakpoint bool) HaltInfo {
 	// Dynamic (hardware) breakpoint at the instruction about to execute,
 	// unless the debugger explicitly asked to step over it.
 	if !overBreakpoint {
-		if hits, ok := t.breakpts[pc]; ok && t.bpEnabled[pc] {
-			t.breakpts[pc] = hits + 1
-			info := HaltInfo{Reason: ReasonBreakpoint, PC: pc, BPAddr: pc}
-			t.state = StateHalted
-			t.lastHalt = info
-			return info
+		if bp, ok := t.breakpts[pc]; ok && bp.enabled {
+			bp.hits++
+			if bp.qualifiesLocked(t) {
+				bp.stops++
+				reason := ReasonBreakpoint
+				if bp.cond != nil || bp.threshold > 0 {
+					reason = ReasonBreakpointCond
+				}
+				info := HaltInfo{Reason: reason, PC: pc, BPAddr: pc, BPHits: bp.hits}
+				t.state = StateHalted
+				t.lastHalt = info
+				return info
+			}
+			// Condition false or threshold not yet reached: count the hit
+			// (visible via Breakpoints) but keep executing.
 		}
 	}
 
@@ -186,7 +208,10 @@ func (t *Target) Step() (HaltInfo, error) {
 		return HaltInfo{}, err
 	}
 	t.state = StateRunning
-	over := t.bpEnabled[t.regs[RegPC]]
+	_, over := t.breakpts[t.regs[RegPC]]
+	if over && !t.breakpts[t.regs[RegPC]].enabled {
+		over = false
+	}
 	info := t.stepLocked(over)
 	if info.Reason == ReasonNone {
 		info = HaltInfo{Reason: ReasonStep, PC: t.regs[RegPC]}
@@ -209,6 +234,17 @@ func (t *Target) Continue() (HaltInfo, error) {
 // exactly like Interrupt: the current instruction completes, state becomes
 // halted with ReasonPause and PC at the next instruction boundary.
 func (t *Target) ContinueCtx(ctx context.Context) (HaltInfo, error) {
+	return t.continueCtx(ctx, nil)
+}
+
+// ContinueStarted is ContinueCtx plus a start signal: started (if non-nil) is
+// closed once the core is marked running and the run handle is registered,
+// so a caller that needs to Interrupt afterwards cannot race the startup.
+func (t *Target) ContinueStarted(ctx context.Context, started chan<- struct{}) (HaltInfo, error) {
+	return t.continueCtx(ctx, started)
+}
+
+func (t *Target) continueCtx(ctx context.Context, started chan<- struct{}) (HaltInfo, error) {
 	t.mu.Lock()
 	if err := t.requireHaltedLocked(); err != nil {
 		t.mu.Unlock()
@@ -218,6 +254,9 @@ func (t *Target) ContinueCtx(ctx context.Context) (HaltInfo, error) {
 	run := &runHandle{stop: make(chan struct{}), done: make(chan struct{})}
 	t.run = run
 	t.mu.Unlock()
+	if started != nil {
+		close(started)
+	}
 	defer close(run.done)
 
 	ctxStop := make(chan struct{})
@@ -249,8 +288,8 @@ func (t *Target) ContinueCtx(ctx context.Context) (HaltInfo, error) {
 	// address (or a step/PAUSE) still traps on the first hit.
 	skipFirst := false
 	t.mu.Lock()
-	if t.lastHalt.Reason == ReasonBreakpoint {
-		if pc := t.regs[RegPC]; t.bpEnabled[pc] {
+	if t.lastHalt.Reason == ReasonBreakpoint || t.lastHalt.Reason == ReasonBreakpointCond {
+		if bp, ok := t.breakpts[t.regs[RegPC]]; ok && bp.enabled {
 			skipFirst = true
 		}
 	}
